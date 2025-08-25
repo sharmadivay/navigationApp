@@ -51,12 +51,15 @@ class MainViewController: UIViewController {
     
     var currentPolyline: MKPolyline?
     var fullRouteCoordinates: [CLLocationCoordinate2D] = []
+    var allRouteCoordinates: [[CLLocationCoordinate2D]] = []
+    var currentRouteIndex: Int = 0   
     
     override func viewDidLoad() {
         super.viewDidLoad()
         mapView.delegate = self
         
         locationManager.requestWhenInUseAuthorization()
+        locationManager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
         
         searchBar.addTarget(self, action: #selector(change), for: .editingChanged)
         
@@ -141,41 +144,40 @@ class MainViewController: UIViewController {
                 }
             }
             .store(in: &cancellables)
-        viewStore
-            .publisher
-            .selectedRoute
-            .sink{[weak self] selectedRoute in
-                guard let self = self else {
-                    return
-                }
+        viewStore.publisher.selectedRoute
+            .sink { [weak self] selectedRoute in
+                guard let self = self else { return }
                 
                 guard let route = selectedRoute else {
                     self.mapView.removeOverlays(self.mapView.overlays)
                     self.currentPolyline = nil
+                    self.allRouteCoordinates = []
                     return
                 }
                 
                 self.mapView.removeOverlays(self.mapView.overlays)
                 self.searchBar.isHidden = true
                 
-                if let current = currentPolyline {
-                    mapView.removeOverlay(current)
+                // Get all routes from store (instead of only selectedRoute)
+                let routes = self.viewStore.routes // <- add this in your TCA state
+                
+                self.allRouteCoordinates = routes.map { route in
+                    let polyline = route.polyline
+                    var coords = [CLLocationCoordinate2D](repeating: kCLLocationCoordinate2DInvalid,
+                                                          count: polyline.pointCount)
+                    polyline.getCoordinates(&coords, range: NSRange(location: 0, length: polyline.pointCount))
+                    return coords
                 }
                 
-                // Save all coordinates of this route
-                let polyline = route.polyline
-                var coords = [CLLocationCoordinate2D](repeating: kCLLocationCoordinate2DInvalid,
-                                                      count: polyline.pointCount)
-                polyline.getCoordinates(&coords, range: NSRange(location: 0, length: polyline.pointCount))
-                fullRouteCoordinates = coords
+                // Start with selected route
+                self.currentRouteIndex = routes.firstIndex(where: { $0 == route }) ?? 0
+                self.fullRouteCoordinates = self.allRouteCoordinates[self.currentRouteIndex]
                 
                 self.currentPolyline = route.polyline
-                self.mapView.addOverlay(currentPolyline ?? polyline)
-                self.mapView.setVisibleMapRect(
-                    route.polyline.boundingMapRect,
-                    edgePadding: UIEdgeInsets(top: 80, left: 40, bottom: 120, right: 40),
-                    animated: true
-                )
+                self.mapView.addOverlay(self.currentPolyline!)
+                self.mapView.setVisibleMapRect(route.polyline.boundingMapRect,
+                                               edgePadding: UIEdgeInsets(top: 80, left: 40, bottom: 120, right: 40),
+                                               animated: true)
             }
             .store(in: &cancellables)
         viewStore
@@ -240,7 +242,59 @@ class MainViewController: UIViewController {
         // Insert current user location at the start (so polyline starts from user)
         remaining.insert(userCoord, at: 0)
         
-        return remaining
+        return remaining    }
+    
+    func updateActiveRoute(
+        from userCoord: CLLocationCoordinate2D,
+        allRoutes: [[CLLocationCoordinate2D]],
+        currentRouteIndex: Int,
+        switchThreshold: CLLocationDistance = 30
+    ) -> (updatedCoords: [CLLocationCoordinate2D], newRouteIndex: Int) {
+        
+        guard !allRoutes.isEmpty else { return ([], currentRouteIndex) }
+        let userLoc = CLLocation(latitude: userCoord.latitude, longitude: userCoord.longitude)
+        
+        // --- 1. Calculate distance from user to each route ---
+        var routeDistances: [Int: CLLocationDistance] = [:]
+        
+        for (i, route) in allRoutes.enumerated() {
+            guard !route.isEmpty else { continue }
+            
+            // Find nearest point on this route
+            let nearestDistance = route.map {
+                CLLocation(latitude: $0.latitude, longitude: $0.longitude)
+                    .distance(from: userLoc)
+            }.min() ?? Double.greatestFiniteMagnitude
+            
+            routeDistances[i] = nearestDistance
+        }
+        
+        // --- 2. Choose the best route ---
+        // Default: stay on current route
+        var chosenIndex = currentRouteIndex
+        if let nearest = routeDistances.min(by: { $0.value < $1.value }) {
+            let (nearestIndex, nearestDistance) = nearest
+            if nearestIndex != currentRouteIndex && nearestDistance < switchThreshold {
+                // Switch only if another route is closer than threshold
+                chosenIndex = nearestIndex
+            }
+        }
+        
+        // --- 3. Trim the chosen route ---
+        let chosenRoute = allRoutes[chosenIndex]
+        guard !chosenRoute.isEmpty else { return ([], chosenIndex) }
+        
+        // Find nearest point index on chosen route
+        let nearestIndex = chosenRoute.enumerated().min(by: { a, b in
+            let locA = CLLocation(latitude: a.element.latitude, longitude: a.element.longitude)
+            let locB = CLLocation(latitude: b.element.latitude, longitude: b.element.longitude)
+            return userLoc.distance(from: locA) < userLoc.distance(from: locB)
+        })?.offset ?? 0
+        
+        var remaining = Array(chosenRoute[nearestIndex..<chosenRoute.count])
+        remaining.insert(userCoord, at: 0) // start at user
+        
+        return (remaining, chosenIndex)
     }
     
     private func showNavigationEtaStack() {

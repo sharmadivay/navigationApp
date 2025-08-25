@@ -147,7 +147,6 @@ struct MainFeature: Reducer {
             state.selectedRoute = route
             state.isSheetPresented = false
             state.refreshCounter += 1
-            state.routes.removeAll()
             return .none
         case .isNavigationCrossButtonTapped:
             state = MainFeature.State(userLocation: state.userLocation)
